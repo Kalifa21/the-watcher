@@ -1,69 +1,84 @@
-require('dotenv').config(); // Load hidden variables
+require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
 const express = require('express');
+const mongoose = require('mongoose'); // NEW: Database Tool
 
-// --- SECURE CONFIGURATION ---
-// The bot now looks for the token in the environment variables
-const TOKEN = process.env.TELEGRAM_TOKEN; 
+// --- CONFIGURATION ---
+const TOKEN = process.env.TELEGRAM_TOKEN;
+const MONGO_URI = process.env.MONGO_URI; // NEW: Database Password
+const CHECK_INTERVAL = 15000;
+const MAX_WALLETS = 5;
 
-// Safety Check: Stop if no token is found
-if (!TOKEN) {
-    console.error("❌ ERROR: No Token found! Make sure you have a .env file locally or set the Environment Variable on Render.");
-    process.exit(1);
-}
+// Safety Checks
+if (!TOKEN) { console.error("❌ ERROR: Missing TELEGRAM_TOKEN"); process.exit(1); }
+if (!MONGO_URI) { console.error("❌ ERROR: Missing MONGO_URI"); process.exit(1); }
 
-const DB_FILE = path.join(__dirname, 'user_database.json');
-const CHECK_INTERVAL = 15000; // Check every 15 seconds
-const MAX_WALLETS = 5; 
+// --- MONGODB SETUP (The Persistent Brain) ---
+mongoose.connect(MONGO_URI)
+    .then(() => console.log("✅ Connected to MongoDB"))
+    .catch(err => console.error("❌ MongoDB Error:", err));
 
-// --- CLOUD SERVER SETUP (Keep-Alive) ---
+// Define the "Shape" of our data
+const userSchema = new mongoose.Schema({
+    chatId: { type: String, required: true, unique: true },
+    wallets: [{
+        address: String,
+        name: String,
+        lastHash: String
+    }]
+});
+const User = mongoose.model('User', userSchema);
+// ---------------------------------------------
+
+// --- CLOUD SERVER SETUP ---
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-app.get('/', (req, res) => {
-    res.send('Watcher Bot is Alive!');
-});
-
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
-// ---------------------------------------
+app.get('/', (req, res) => res.send('Watcher Bot is Alive & Connected to DB!'));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 const userState = {};
 
-// --- DATABASE FUNCTIONS ---
-function loadDB() {
-    if (!fs.existsSync(DB_FILE)) return {};
-    try { return JSON.parse(fs.readFileSync(DB_FILE)); } catch (e) { return {}; }
+// --- NEW DATABASE FUNCTIONS (Async) ---
+
+async function getWallets(chatId) {
+    const user = await User.findOne({ chatId });
+    return user ? user.wallets : [];
 }
 
-function saveDB(data) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
-}
-
-function addWallet(chatId, address, name) {
-    const db = loadDB();
-    const userWallets = db[chatId] || [];
-    
-    if (userWallets.length >= MAX_WALLETS) return "LIMIT_REACHED";
+async function addWallet(chatId, address, name) {
     const cleanAddress = address.trim().toLowerCase();
-    if (userWallets.find(w => w.address === cleanAddress)) return "DUPLICATE";
+    
+    // Find user or create new one
+    let user = await User.findOne({ chatId });
+    if (!user) {
+        user = new User({ chatId, wallets: [] });
+    }
 
-    userWallets.push({ address: cleanAddress, name, lastHash: null });
-    db[chatId] = userWallets;
-    saveDB(db);
+    // Checks
+    if (user.wallets.length >= MAX_WALLETS) return "LIMIT_REACHED";
+    if (user.wallets.find(w => w.address === cleanAddress)) return "DUPLICATE";
+
+    // Add
+    user.wallets.push({ address: cleanAddress, name, lastHash: null });
+    await user.save(); // Save to Cloud
     return "SUCCESS";
 }
 
-function removeWallet(chatId, address) {
-    const db = loadDB();
-    if (!db[chatId]) return;
-    db[chatId] = db[chatId].filter(w => w.address !== address);
-    saveDB(db);
+async function removeWallet(chatId, address) {
+    const user = await User.findOne({ chatId });
+    if (user) {
+        user.wallets = user.wallets.filter(w => w.address !== address);
+        await user.save();
+    }
+}
+
+async function updateWalletHash(chatId, address, newHash) {
+    await User.updateOne(
+        { chatId, "wallets.address": address },
+        { $set: { "wallets.$.lastHash": newHash } }
+    );
 }
 
 // --- BOT INTERFACE ---
@@ -71,7 +86,7 @@ bot.onText(/\/start/, (msg) => {
     bot.sendMessage(msg.chat.id, 
         "👋 **Welcome to The Watcher** 👁️\n\n" +
         "I am your private spy for Polymarket whales. 🐋\n" +
-        "Add up to **5 Wallets** and get instant alerts on their trades.\n\n" +
+        "Your data is now **securely saved in the cloud.** ☁️\n\n" +
         "_Stay Alpha._ 🚀", 
         {
             parse_mode: "Markdown",
@@ -85,16 +100,15 @@ bot.onText(/\/start/, (msg) => {
 });
 
 bot.on('message', async (msg) => {
-    const chatId = msg.chat.id;
+    const chatId = msg.chat.id.toString(); // Ensure ID is string
     const text = msg.text;
     if (text.startsWith('/')) return;
     if (!userState[chatId]) userState[chatId] = { step: null };
 
     // --- ADD WALLET ---
     if (text === "➕ Add Wallet") {
-        const db = loadDB();
-        const count = (db[chatId] || []).length;
-        if (count >= MAX_WALLETS) {
+        const wallets = await getWallets(chatId);
+        if (wallets.length >= MAX_WALLETS) {
             bot.sendMessage(chatId, `⚠️ Limit Reached (${MAX_WALLETS} Max).`, { parse_mode: "Markdown" });
             return;
         }
@@ -111,19 +125,21 @@ bot.on('message', async (msg) => {
     }
 
     if (userState[chatId].step === 'WAITING_FOR_NAME') {
-        const result = addWallet(chatId, userState[chatId].tempAddress, text);
+        const result = await addWallet(chatId, userState[chatId].tempAddress, text);
+        
         if (result === "SUCCESS") bot.sendMessage(chatId, `✅ **Added!**\nNow tracking: **${text}**`, { parse_mode: "Markdown" });
         else if (result === "LIMIT_REACHED") bot.sendMessage(chatId, "⚠️ Limit reached.");
         else if (result === "DUPLICATE") bot.sendMessage(chatId, "⚠️ Already tracking this.");
+        
         userState[chatId] = { step: null };
         return;
     }
 
     // --- VIEW WATCHLIST ---
     if (text === "📋 View Watchlist") {
-        const db = loadDB();
-        const wallets = db[chatId] || [];
+        const wallets = await getWallets(chatId);
         if (wallets.length === 0) return bot.sendMessage(chatId, "📭 Watchlist empty.");
+        
         const buttons = wallets.map(w => [{ text: `🗑 Remove ${w.name}`, callback_data: `DEL_${w.address}` }]);
         bot.sendMessage(chatId, `📋 **Your Watchlist (${wallets.length}/${MAX_WALLETS}):**`, { reply_markup: { inline_keyboard: buttons } });
     }
@@ -134,13 +150,13 @@ bot.on('message', async (msg) => {
     }
     
     if (text === "❓ Help") {
-        bot.sendMessage(chatId, "ℹ️ **Info:**\n• Track up to 5 wallets.\n• Data is private to you.\n• Alerts are instant.");
+        bot.sendMessage(chatId, "ℹ️ **Info:**\n• Track up to 5 wallets.\n• Data saved in MongoDB.\n• Alerts are instant.");
     }
 });
 
-bot.on('callback_query', (q) => {
+bot.on('callback_query', async (q) => {
     if (q.data.startsWith('DEL_')) {
-        removeWallet(q.message.chat.id, q.data.replace('DEL_', ''));
+        await removeWallet(q.message.chat.id.toString(), q.data.replace('DEL_', ''));
         bot.answerCallbackQuery(q.id, { text: "Deleted" });
         bot.deleteMessage(q.message.chat.id, q.message.message_id);
     }
@@ -148,21 +164,16 @@ bot.on('callback_query', (q) => {
 
 // --- TRACKER LOGIC ---
 async function scanUser(chatId, isManual = false) {
-    const db = loadDB();
-    const wallets = db[chatId];
+    const wallets = await getWallets(chatId);
     if (!wallets || wallets.length === 0) {
         if (isManual) bot.sendMessage(chatId, "📭 No wallets.");
         return;
     }
 
     let updatesFound = false;
-    const updatedWallets = [];
 
     for (const w of wallets) {
         try {
-            // DEBUG LOG:
-            console.log(`Checking ${w.name}...`);
-
             const res = await axios.get(`https://data-api.polymarket.com/activity`, {
                 params: { user: w.address, limit: 1, sortBy: 'TIMESTAMP', sortDirection: 'DESC' }
             });
@@ -174,15 +185,12 @@ async function scanUser(chatId, isManual = false) {
                 if (w.lastHash && w.lastHash !== currentHash) {
                     if (trade.type === "TRADE") {
                         const side = trade.side; 
-                        
-                        // FORMATTING: Prioritize 'outcome', then 'asset'. Ignore raw numbers.
                         let assetName = trade.outcome || trade.asset || "Position";
                         if (/^\d+$/.test(assetName)) assetName = "Position"; 
 
                         const title = trade.title || "Unknown Market";
                         const amount = parseFloat((trade.size || 0) * (trade.price || 0)).toFixed(2);
                         const link = `https://polymarket.com/market/${trade.slug}`;
-                        
                         const action = side === "BUY" ? "Buys" : "Sells";
                         const emoji = side === "BUY" ? "🟢" : "🔴";
 
@@ -194,32 +202,31 @@ async function scanUser(chatId, isManual = false) {
                         bot.sendMessage(chatId, msg, { parse_mode: "Markdown", disable_web_page_preview: true });
                         updatesFound = true;
                     }
+                    // Update Hash in Cloud DB
+                    await updateWalletHash(chatId, w.address, currentHash);
                 } else if (!w.lastHash) {
-                    console.log("   ✅ Initial Sync");
+                     // Initial Sync
+                     await updateWalletHash(chatId, w.address, currentHash);
                 }
-                w.lastHash = currentHash;
             }
         } catch (e) {
-            console.error(`   ❗ ERROR checking ${w.name}:`, e.message);
+            console.error(`Error checking ${w.name}:`, e.message);
         }
-        updatedWallets.push(w);
     }
-
-    db[chatId] = updatedWallets;
-    saveDB(db);
 
     if (isManual && !updatesFound) bot.sendMessage(chatId, "✅ No new trades.");
 }
 
 // --- GLOBAL AUTO-SCANNER ---
 setInterval(async () => {
-    const db = loadDB();
-    const users = Object.keys(db);
+    // Find all users in DB
+    const users = await User.find({});
     if (users.length > 0) {
-        // Heartbeat dot in terminal
         process.stdout.write("."); 
-        for (const id of users) await scanUser(id, false);
+        for (const user of users) {
+            await scanUser(user.chatId, false);
+        }
     }
 }, CHECK_INTERVAL);
 
-console.log("Cloud Watcher Running...");
+console.log("MongoDB Watcher Running...");
