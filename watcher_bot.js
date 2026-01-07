@@ -24,9 +24,9 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', userSchema);
 
-// --- SERVER KEEPALIVE (For UptimeRobot) ---
+// --- SERVER KEEPALIVE ---
 const app = express();
-app.get('/', (req, res) => res.send('Watcher Bot: Alpha Scout Edition Online 🟢'));
+app.get('/', (req, res) => res.send('The Watcher: Online 🟢'));
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 const bot = new TelegramBot(TOKEN, { polling: true });
@@ -71,7 +71,6 @@ class MarketDetector {
             const sellVol = data.sells.reduce((sum, t) => sum + t.amountUSD, 0);
             
             // 2. Ratio Check (Noise Filter)
-            // Buy Volume must be 3x Sell Volume (unless Sells are 0)
             const ratio = sellVol === 0 ? buyVol : (buyVol / sellVol);
             if (sellVol > 0 && ratio < 3.0) continue;
 
@@ -98,7 +97,7 @@ class MarketDetector {
                     totalVol: buyVol,
                     uniqueWallets: uniqueBuyers,
                     ratio: ratio,
-                    marketId: marketId // Used for link
+                    marketId: marketId
                 });
             }
         }
@@ -149,7 +148,6 @@ async function scanSpecificWallets(chatId, isManual = false) {
                         { $set: { "wallets.$.lastHash": currentHash } }
                     );
                 } else if (!w.lastHash) {
-                    // Initial Sync
                     await User.updateOne(
                         { chatId, "wallets.address": w.address },
                         { $set: { "wallets.$.lastHash": currentHash } }
@@ -160,12 +158,12 @@ async function scanSpecificWallets(chatId, isManual = false) {
     }
 
     if (isManual && !updatesFound) {
-        bot.sendMessage(chatId, "✅ No new trades found since last check.");
+        bot.sendMessage(chatId, "✅ No new trades found.");
     }
 }
 
 // ============================================================
-// 🐺 FEATURE 2 & 3: GLOBAL HUNTER (Official API Version)
+// 🐺 FEATURE 2 & 3: GLOBAL HUNTER (Official Gamma API)
 // ============================================================
 async function scanGlobalMarket() {
     try {
@@ -183,21 +181,20 @@ async function scanGlobalMarket() {
         // 2. Scan each Hot Market for new trades
         const scanPromises = markets.map(async (market) => {
             try {
-                // Fetch last 3 trades for this specific market
+                // Fetch last 5 trades for this specific market
                 const { data: trades } = await axios.get(`https://data-api.polymarket.com/activity`, {
                     params: {
-                        limit: 3,
+                        limit: 5,
                         slug: market.slug,
-                        type: 'TRADE' // Only actual trades
+                        type: 'TRADE'
                     }
                 });
 
                 // Feed the Brain
                 trades.forEach(t => {
-                    // Check if trade is valid and a "Buy"
                     if (t.side === 'BUY') {
                         detector.addTrade({
-                            timestamp: new Date(t.timestamp).getTime(), // Convert to ms
+                            timestamp: new Date(t.timestamp).getTime(),
                             amountUSD: parseFloat(t.size) * parseFloat(t.price),
                             user: t.taker || t.proxyWallet || "Unknown", 
                             marketId: market.id,
@@ -209,14 +206,13 @@ async function scanGlobalMarket() {
                     }
                 });
             } catch (err) {
-                // Ignore errors for individual markets to keep the bot running
+                // Ignore individual market errors
             }
         });
 
-        // Wait for all scans to finish
         await Promise.all(scanPromises);
 
-        // 3. Ask the Brain for signals
+        // 3. Check for signals
         const signals = detector.checkSignals();
 
         if (signals.length > 0) {
@@ -249,34 +245,39 @@ function formatAlert(alert) {
            `👥 <b>Unique Wallets:</b> ${alert.uniqueWallets}\n` +
            `⚖️ <b>Buy Pressure:</b> ${ratioStr}x\n` +
            `⏱ <b>Time Window:</b> 60s\n\n` +
-           `<a href="https://polymarket.com/market/${alert.marketId}">View Market</a>`;
+           `<a href="https://polymarket.com/market/${alert.marketSlug}">View Market</a>`;
 }
 
 // ============================================================
-// 🤖 BOT COMMANDS & INTERFACE
+// 🤖 BOT INTERFACE
 // ============================================================
-bot.onText(/\/start/, (msg) => {
+bot.onText(/\/start/, async (msg) => {
+    const chatId = msg.chat.id;
+    // Get wallet count for better UX
+    let user = await User.findOne({ chatId });
+    const walletCount = user ? user.wallets.length : 0;
+
     const welcomeMsg = 
-        "🏰 **Welcome to Alpha Scout.**\n\n" +
-        "You are now connected to the Citadel's surveillance grid. 👁️\n\n" +
-        "**System Status:**\n" +
-        "🟢 **Sentinel:** Active (Private Watchlist)\n" +
-        "🐺 **Wolf Pack:** Active (Global Cluster Detection)\n" +
-        "🌊 **Surge:** Active (Whale Volume Tracking)\n\n" +
-        "_Select a command below to begin._";
+        "👁️ **The Watcher is Online.**\n\n" +
+        "I am your private surveillance tool for Polymarket.\n\n" +
+        "**Active Systems:**\n" +
+        "🟢 **Sentinel:** Tracking your watchlist.\n" +
+        "🐺 **Wolf Pack:** Scanning 20+ markets for clusters.\n" +
+        "🌊 **Surge:** Detecting whale momentum.\n\n" +
+        "_Select an option below:_";
 
     const opts = {
         parse_mode: "Markdown",
         reply_markup: {
             keyboard: [
-                ["➕ Add Wallet", "📋 View Watchlist"],
+                ["➕ Add Wallet", `📋 View Watchlist (${walletCount}/5)`],
                 ["🚀 Scan My List", "❓ Help"]
             ],
             resize_keyboard: true,
             is_persistent: true
         }
     };
-    bot.sendMessage(msg.chat.id, welcomeMsg, opts);
+    bot.sendMessage(chatId, welcomeMsg, opts);
 });
 
 bot.on('message', async (msg) => {
@@ -286,7 +287,7 @@ bot.on('message', async (msg) => {
 
     if (!userState[chatId]) userState[chatId] = { step: null };
 
-    // --- ADD WALLET FLOW ---
+    // --- ADD WALLET ---
     if (text === "➕ Add Wallet") {
         userState[chatId].step = 'WAITING_FOR_ADDRESS';
         bot.sendMessage(chatId, "🕵️ **Paste the Polymarket Address:**", {parse_mode: "Markdown"});
@@ -314,29 +315,29 @@ bot.on('message', async (msg) => {
     }
 
     // --- VIEW WATCHLIST ---
-    if (text === "📋 View Watchlist") {
+    if (text.startsWith("📋 View Watchlist")) {
         const user = await User.findOne({ chatId });
         if (!user || !user.wallets.length) return bot.sendMessage(chatId, "📭 Your watchlist is empty.");
         const buttons = user.wallets.map(w => [{ text: `🗑 Remove ${w.name}`, callback_data: `DEL_${w.address}` }]);
-        bot.sendMessage(chatId, "📋 **Your Watchlist:**", { reply_markup: { inline_keyboard: buttons }, parse_mode: "Markdown" });
+        bot.sendMessage(chatId, `📋 **Your Watchlist (${user.wallets.length}/5):**`, { reply_markup: { inline_keyboard: buttons }, parse_mode: "Markdown" });
     }
 
-    // --- SCAN MY LIST (Manual Trigger) ---
+    // --- SCAN MY LIST ---
     if (text === "🚀 Scan My List") {
         bot.sendMessage(chatId, "🔎 Scanning your targets...");
         await scanSpecificWallets(chatId, true);
     }
 
-    // --- HELP BUTTON ---
+    // --- HELP ---
     if (text === "❓ Help") {
         const helpMsg = 
-            "ℹ️ **How to use Alpha Scout:**\n\n" +
+            "ℹ️ **How to use The Watcher:**\n\n" +
             "1️⃣ **Sentinel (Private Spy):**\n" +
-            "Click 'Add Wallet' to track a specific person. You get an alert whenever they trade.\n\n" +
+            "Add up to 5 wallets. You get an alert whenever they trade.\n\n" +
             "2️⃣ **Wolf Pack (Global Radar):**\n" +
-            "You don't need to do anything! The bot automatically scans the Top 20 markets. If 3+ strangers coordinate a buy >$10k, everyone gets an alert.\n\n" +
+            "I automatically scan the Top 20 trending markets. If 3+ strangers buy together (>$10k), you get an alert.\n\n" +
             "3️⃣ **Volume Surge:**\n" +
-            "Automatic alert if ANYONE buys >$15k in a single clip.";
+            "Alerts if ANYONE buys >$15k in a single clip.";
         
         bot.sendMessage(chatId, helpMsg, { parse_mode: "Markdown" });
     }
@@ -354,7 +355,7 @@ bot.on('callback_query', async (q) => {
 // 🔄 LOOPS
 // ============================================================
 
-// Loop 1: Check Private Wallets (Every 15s)
+// Loop 1: Sentinel (Every 15s)
 setInterval(async () => {
     const users = await User.find({});
     for (const user of users) {
@@ -362,10 +363,9 @@ setInterval(async () => {
     }
 }, USER_SCAN_INTERVAL);
 
-// Loop 2: Check Global Market (Every 15s)
+// Loop 2: Wolf Pack (Every 15s)
 setInterval(async () => {
-    process.stdout.write("."); // Heartbeat for logs
     await scanGlobalMarket();
 }, GLOBAL_SCAN_INTERVAL);
 
-console.log("🔥 Watcher Bot v2: Alpha Scout Edition Running...");
+console.log("🔥 The Watcher v3: Online...");
