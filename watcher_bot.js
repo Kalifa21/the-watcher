@@ -79,12 +79,12 @@ class MarketDetector {
 
             let alertType = null;
 
-            // --- CONDITION A: WOLF PACK (3+ Strangers, >$10k) ---
-            if (uniqueBuyers >= 3 && buyVol > 10000) {
+            // --- CONDITION A: WOLF PACK (3+ Strangers, >$10) ---
+            if (uniqueBuyers >= 1 && buyVol > 10) {
                 alertType = "WOLF_PACK";
             }
-            // --- CONDITION B: VOLUME SURGE (Any Count, >$15k) ---
-            else if (buyVol > 15000) {
+            // --- CONDITION B: VOLUME SURGE (Any Count, >$100) ---
+            else if (buyVol > 100) {
                 alertType = "VOLUME_SURGE";
             }
 
