@@ -1,178 +1,122 @@
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
+const mongoose = require('mongoose');
 const express = require('express');
-const mongoose = require('mongoose'); // NEW: Database Tool
+const { request, gql } = require('graphql-request');
 
 // --- CONFIGURATION ---
 const TOKEN = process.env.TELEGRAM_TOKEN;
-const MONGO_URI = process.env.MONGO_URI; // NEW: Database Password
-const CHECK_INTERVAL = 15000;
-const MAX_WALLETS = 5;
+const MONGO_URI = process.env.MONGO_URI;
+const PORT = process.env.PORT || 3000;
 
-// Safety Checks
-if (!TOKEN) { console.error("❌ ERROR: Missing TELEGRAM_TOKEN"); process.exit(1); }
-if (!MONGO_URI) { console.error("❌ ERROR: Missing MONGO_URI"); process.exit(1); }
+// Intervals
+const USER_SCAN_INTERVAL = 15000;   // Feature 1: Check your watchlist every 15s
+const GLOBAL_SCAN_INTERVAL = 15000; // Feature 2/3: Check global market every 15s
 
-// --- MONGODB SETUP (The Persistent Brain) ---
+// --- DATABASE SETUP ---
 mongoose.connect(MONGO_URI)
     .then(() => console.log("✅ Connected to MongoDB"))
     .catch(err => console.error("❌ MongoDB Error:", err));
 
-// Define the "Shape" of our data
 const userSchema = new mongoose.Schema({
     chatId: { type: String, required: true, unique: true },
-    wallets: [{
-        address: String,
-        name: String,
-        lastHash: String
-    }]
+    wallets: [{ address: String, name: String, lastHash: String }]
 });
 const User = mongoose.model('User', userSchema);
-// ---------------------------------------------
 
-// --- CLOUD SERVER SETUP ---
+// --- SERVER KEEPALIVE (For UptimeRobot) ---
 const app = express();
-const PORT = process.env.PORT || 3000;
-app.get('/', (req, res) => res.send('Watcher Bot is Alive & Connected to DB!'));
+app.get('/', (req, res) => res.send('Watcher Bot: Wolf Pack Edition Online 🟢'));
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 const userState = {};
 
-// --- NEW DATABASE FUNCTIONS (Async) ---
-
-async function getWallets(chatId) {
-    const user = await User.findOne({ chatId });
-    return user ? user.wallets : [];
-}
-
-async function addWallet(chatId, address, name) {
-    const cleanAddress = address.trim().toLowerCase();
-    
-    // Find user or create new one
-    let user = await User.findOne({ chatId });
-    if (!user) {
-        user = new User({ chatId, wallets: [] });
+// ============================================================
+// 🧠 THE BRAIN: MarketDetector Class (Wolf Pack Logic)
+// ============================================================
+class MarketDetector {
+    constructor() {
+        this.tradeWindow = []; // Stores recent global trades
+        this.alertCooldowns = {}; // Prevents spam
     }
 
-    // Checks
-    if (user.wallets.length >= MAX_WALLETS) return "LIMIT_REACHED";
-    if (user.wallets.find(w => w.address === cleanAddress)) return "DUPLICATE";
-
-    // Add
-    user.wallets.push({ address: cleanAddress, name, lastHash: null });
-    await user.save(); // Save to Cloud
-    return "SUCCESS";
-}
-
-async function removeWallet(chatId, address) {
-    const user = await User.findOne({ chatId });
-    if (user) {
-        user.wallets = user.wallets.filter(w => w.address !== address);
-        await user.save();
+    addTrade(trade) {
+        this.tradeWindow.push(trade);
+        // Prune trades older than 60 seconds (The sliding window)
+        const cutoff = Date.now() - 60000;
+        this.tradeWindow = this.tradeWindow.filter(t => t.timestamp > cutoff);
     }
-}
 
-async function updateWalletHash(chatId, address, newHash) {
-    await User.updateOne(
-        { chatId, "wallets.address": address },
-        { $set: { "wallets.$.lastHash": newHash } }
-    );
-}
+    checkSignals() {
+        const now = Date.now();
+        const signals = [];
+        
+        // Group trades by Market/Token
+        const groups = {};
+        this.tradeWindow.forEach(t => {
+            if (!groups[t.marketId]) {
+                groups[t.marketId] = { buys: [], sells: [], meta: t };
+            }
+            if (t.side === 'Buy') groups[t.marketId].buys.push(t);
+            else groups[t.marketId].sells.push(t);
+        });
 
-// --- BOT INTERFACE ---
-bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, 
-        "👋 **Welcome to The Watcher** 👁️\n\n" +
-        "I am your private spy for Polymarket whales. 🐋\n" +
-        "Your data is now **securely saved in the cloud.** ☁️\n\n" +
-        "_Stay Alpha._ 🚀", 
-        {
-            parse_mode: "Markdown",
-            reply_markup: {
-                keyboard: [["➕ Add Wallet", "📋 View Watchlist"], ["🚀 Scan My List", "❓ Help"]],
-                resize_keyboard: true,
-                is_persistent: true
+        // Analyze each Market
+        for (const [marketId, data] of Object.entries(groups)) {
+            // 1. Cooldown Check (Don't alert same market twice in 5 mins)
+            if (this.alertCooldowns[marketId] && (now - this.alertCooldowns[marketId] < 300000)) continue;
+
+            const buyVol = data.buys.reduce((sum, t) => sum + t.amountUSD, 0);
+            const sellVol = data.sells.reduce((sum, t) => sum + t.amountUSD, 0);
+            
+            // 2. Ratio Check (Noise Filter)
+            // Buy Volume must be 3x Sell Volume (unless Sells are 0)
+            const ratio = sellVol === 0 ? buyVol : (buyVol / sellVol);
+            if (sellVol > 0 && ratio < 3.0) continue;
+
+            // 3. Unique Wallets Check
+            const uniqueBuyers = new Set(data.buys.map(t => t.user)).size;
+
+            let alertType = null;
+
+            // --- CONDITION A: WOLF PACK (3+ Strangers, >$10k) ---
+            if (uniqueBuyers >= 3 && buyVol > 10000) {
+                alertType = "WOLF_PACK";
+            }
+            // --- CONDITION B: VOLUME SURGE (Any Count, >$15k) ---
+            else if (buyVol > 15000) {
+                alertType = "VOLUME_SURGE";
+            }
+
+            if (alertType) {
+                this.alertCooldowns[marketId] = now;
+                signals.push({
+                    type: alertType,
+                    marketName: data.meta.marketName,
+                    outcome: data.meta.outcome,
+                    totalVol: buyVol,
+                    uniqueWallets: uniqueBuyers,
+                    ratio: ratio,
+                    marketId: marketId // Used for link
+                });
             }
         }
-    );
-});
-
-bot.on('message', async (msg) => {
-    const chatId = msg.chat.id.toString(); // Ensure ID is string
-    const text = msg.text;
-    if (text.startsWith('/')) return;
-    if (!userState[chatId]) userState[chatId] = { step: null };
-
-    // --- ADD WALLET ---
-    if (text === "➕ Add Wallet") {
-        const wallets = await getWallets(chatId);
-        if (wallets.length >= MAX_WALLETS) {
-            bot.sendMessage(chatId, `⚠️ Limit Reached (${MAX_WALLETS} Max).`, { parse_mode: "Markdown" });
-            return;
-        }
-        userState[chatId].step = 'WAITING_FOR_ADDRESS';
-        bot.sendMessage(chatId, "🕵️ **Paste the Polymarket Address:**", { parse_mode: "Markdown" });
-        return;
+        return signals;
     }
+}
 
-    if (userState[chatId].step === 'WAITING_FOR_ADDRESS') {
-        userState[chatId].tempAddress = text.trim();
-        userState[chatId].step = 'WAITING_FOR_NAME';
-        bot.sendMessage(chatId, "🏷️ **Give this whale a name:**");
-        return;
-    }
+const detector = new MarketDetector();
 
-    if (userState[chatId].step === 'WAITING_FOR_NAME') {
-        const result = await addWallet(chatId, userState[chatId].tempAddress, text);
-        
-        if (result === "SUCCESS") bot.sendMessage(chatId, `✅ **Added!**\nNow tracking: **${text}**`, { parse_mode: "Markdown" });
-        else if (result === "LIMIT_REACHED") bot.sendMessage(chatId, "⚠️ Limit reached.");
-        else if (result === "DUPLICATE") bot.sendMessage(chatId, "⚠️ Already tracking this.");
-        
-        userState[chatId] = { step: null };
-        return;
-    }
+// ============================================================
+// 🕵️ FEATURE 1: PRIVATE WATCHLIST TRACKER (The Sentinel)
+// ============================================================
+async function scanSpecificWallets(chatId) {
+    const user = await User.findOne({ chatId });
+    if (!user || !user.wallets.length) return;
 
-    // --- VIEW WATCHLIST ---
-    if (text === "📋 View Watchlist") {
-        const wallets = await getWallets(chatId);
-        if (wallets.length === 0) return bot.sendMessage(chatId, "📭 Watchlist empty.");
-        
-        const buttons = wallets.map(w => [{ text: `🗑 Remove ${w.name}`, callback_data: `DEL_${w.address}` }]);
-        bot.sendMessage(chatId, `📋 **Your Watchlist (${wallets.length}/${MAX_WALLETS}):**`, { reply_markup: { inline_keyboard: buttons } });
-    }
-
-    if (text === "🚀 Scan My List") {
-        bot.sendMessage(chatId, "🔎 Scanning...");
-        await scanUser(chatId, true);
-    }
-    
-    if (text === "❓ Help") {
-        bot.sendMessage(chatId, "ℹ️ **Info:**\n• Track up to 5 wallets.\n• Data saved in MongoDB.\n• Alerts are instant.");
-    }
-});
-
-bot.on('callback_query', async (q) => {
-    if (q.data.startsWith('DEL_')) {
-        await removeWallet(q.message.chat.id.toString(), q.data.replace('DEL_', ''));
-        bot.answerCallbackQuery(q.id, { text: "Deleted" });
-        bot.deleteMessage(q.message.chat.id, q.message.message_id);
-    }
-});
-
-// --- TRACKER LOGIC ---
-async function scanUser(chatId, isManual = false) {
-    const wallets = await getWallets(chatId);
-    if (!wallets || wallets.length === 0) {
-        if (isManual) bot.sendMessage(chatId, "📭 No wallets.");
-        return;
-    }
-
-    let updatesFound = false;
-
-    for (const w of wallets) {
+    for (const w of user.wallets) {
         try {
             const res = await axios.get(`https://data-api.polymarket.com/activity`, {
                 params: { user: w.address, limit: 1, sortBy: 'TIMESTAMP', sortDirection: 'DESC' }
@@ -184,49 +128,184 @@ async function scanUser(chatId, isManual = false) {
 
                 if (w.lastHash && w.lastHash !== currentHash) {
                     if (trade.type === "TRADE") {
-                        const side = trade.side; 
-                        let assetName = trade.outcome || trade.asset || "Position";
-                        if (/^\d+$/.test(assetName)) assetName = "Position"; 
-
-                        const title = trade.title || "Unknown Market";
                         const amount = parseFloat((trade.size || 0) * (trade.price || 0)).toFixed(2);
-                        const link = `https://polymarket.com/market/${trade.slug}`;
-                        const action = side === "BUY" ? "Buys" : "Sells";
-                        const emoji = side === "BUY" ? "🟢" : "🔴";
-
-                        const msg = `${emoji} **${w.name} Alert**\n\n` +
-                                    `**${action} ${assetName}** in _${title}_\n` +
-                                    `💰 Value: $${amount}\n` +
-                                    `🔗 [View Market](${link})`;
-
-                        bot.sendMessage(chatId, msg, { parse_mode: "Markdown", disable_web_page_preview: true });
-                        updatesFound = true;
+                        const msg = `🔔 <b>${w.name} Alert</b>\n` +
+                                    `Action: ${trade.side === "BUY" ? "🟢 Buy" : "🔴 Sell"}\n` +
+                                    `Asset: ${trade.outcome || "Position"}\n` +
+                                    `Market: ${trade.title}\n` +
+                                    `Value: $${amount}\n` +
+                                    `<a href="https://polymarket.com/market/${trade.slug}">View Market</a>`;
+                        
+                        bot.sendMessage(chatId, msg, { parse_mode: "HTML", disable_web_page_preview: true });
                     }
-                    // Update Hash in Cloud DB
-                    await updateWalletHash(chatId, w.address, currentHash);
+                    // Update DB with new hash
+                    await User.updateOne(
+                        { chatId, "wallets.address": w.address },
+                        { $set: { "wallets.$.lastHash": currentHash } }
+                    );
                 } else if (!w.lastHash) {
-                     // Initial Sync
-                     await updateWalletHash(chatId, w.address, currentHash);
+                    // Initial Sync
+                    await User.updateOne(
+                        { chatId, "wallets.address": w.address },
+                        { $set: { "wallets.$.lastHash": currentHash } }
+                    );
                 }
             }
-        } catch (e) {
-            console.error(`Error checking ${w.name}:`, e.message);
-        }
+        } catch (e) { console.error(`Error scanning wallet ${w.name}`); }
     }
-
-    if (isManual && !updatesFound) bot.sendMessage(chatId, "✅ No new trades.");
 }
 
-// --- GLOBAL AUTO-SCANNER ---
-setInterval(async () => {
-    // Find all users in DB
-    const users = await User.find({});
-    if (users.length > 0) {
-        process.stdout.write("."); 
-        for (const user of users) {
-            await scanUser(user.chatId, false);
-        }
+// ============================================================
+// 🐺 FEATURE 2 & 3: GLOBAL HUNTER (The Wolf Pack)
+// ============================================================
+async function scanGlobalMarket() {
+    // Queries The Graph for the last 50 Buy transactions
+    const query = gql`
+    {
+      transactions(first: 50, orderBy: timestamp, orderDirection: desc, where: {type: "Buy"}) {
+        id
+        timestamp
+        market { id question slug }
+        user { id }
+        tradeAmount
+        outcomeIndex
+      }
     }
-}, CHECK_INTERVAL);
+    `;
 
-console.log("MongoDB Watcher Running...");
+    try {
+        // Use the standard Polymarket Subgraph
+        const data = await request('https://api.thegraph.com/subgraphs/name/tokenunion/polymarket-matic', query);
+        
+        // Feed the Brain
+        data.transactions.forEach(t => {
+            detector.addTrade({
+                timestamp: t.timestamp * 1000, // Convert to ms
+                amountUSD: parseFloat(t.tradeAmount) / 1000000, // Graph stores in USDC wei (6 decimals)
+                user: t.user.id,
+                marketId: t.market.id, // Unique ID for deduplication
+                marketName: t.market.question,
+                marketSlug: t.market.slug,
+                outcome: t.outcomeIndex === 0 ? "NO" : "YES", 
+                side: "Buy"
+            });
+        });
+
+        // Ask the Brain for signals
+        const signals = detector.checkSignals();
+
+        if (signals.length > 0) {
+            // Broadcast to ALL users
+            const users = await User.find({});
+            for (const sig of signals) {
+                const html = formatAlert(sig);
+                for (const u of users) {
+                    bot.sendMessage(u.chatId, html, { parse_mode: "HTML", disable_web_page_preview: true });
+                }
+            }
+        }
+
+    } catch (e) {
+        console.error("Global Scan Error:", e.message);
+    }
+}
+
+function formatAlert(alert) {
+    let title = "⚠️ <b>Market Alert</b>";
+    if (alert.type === "WOLF_PACK") title = "🚨 <b>Wolf Pack Cluster Detected</b>";
+    if (alert.type === "VOLUME_SURGE") title = "🌊 <b>High Volume Surge Detected</b>";
+
+    const volStr = alert.totalVol.toLocaleString('en-US', { maximumFractionDigits: 0 });
+    const ratioStr = alert.ratio > 100 ? "MAX" : alert.ratio.toFixed(1);
+
+    return `${title}\n\n` +
+           `🎯 <b>Market:</b> ${alert.marketName}\n` +
+           `📈 <b>Outcome:</b> ${alert.outcome}\n` +
+           `💰 <b>Total Vol:</b> $${volStr}\n` +
+           `👥 <b>Unique Wallets:</b> ${alert.uniqueWallets}\n` +
+           `⚖️ <b>Buy Pressure:</b> ${ratioStr}x\n` +
+           `⏱ <b>Time Window:</b> 60s\n\n` +
+           `<a href="https://polymarket.com/market/${alert.marketId}">View Market</a>`;
+}
+
+// ============================================================
+// 🤖 BOT COMMANDS
+// ============================================================
+bot.onText(/\/start/, (msg) => {
+    bot.sendMessage(msg.chat.id, 
+        "👋 **Watcher Online**\n\n" +
+        "1. **Sentinel:** Tracking your watchlist.\n" +
+        "2. **Wolf Pack:** Scanning global activity for clusters.\n" +
+        "3. **Surge:** Watching for massive buys.", 
+        { parse_mode: "Markdown", reply_markup: { keyboard: [["➕ Add Wallet", "📋 View Watchlist"]], resize_keyboard: true } }
+    );
+});
+
+bot.on('message', async (msg) => {
+    const chatId = msg.chat.id.toString();
+    const text = msg.text;
+    if (text.startsWith('/')) return;
+
+    if (!userState[chatId]) userState[chatId] = { step: null };
+
+    // Add Wallet Logic
+    if (text === "➕ Add Wallet") {
+        userState[chatId].step = 'WAITING_FOR_ADDRESS';
+        bot.sendMessage(chatId, "Paste Address:");
+        return;
+    }
+    if (userState[chatId].step === 'WAITING_FOR_ADDRESS') {
+        userState[chatId].tempAddress = text.trim();
+        userState[chatId].step = 'WAITING_FOR_NAME';
+        bot.sendMessage(chatId, "Name this wallet:");
+        return;
+    }
+    if (userState[chatId].step === 'WAITING_FOR_NAME') {
+        let user = await User.findOne({ chatId });
+        if (!user) user = new User({ chatId, wallets: [] });
+        
+        if (user.wallets.length >= 5) {
+            bot.sendMessage(chatId, "Limit Reached (5).");
+        } else {
+            user.wallets.push({ address: userState[chatId].tempAddress, name: text, lastHash: null });
+            await user.save();
+            bot.sendMessage(chatId, `✅ Added ${text}`);
+        }
+        userState[chatId] = { step: null };
+    }
+
+    // View Watchlist Logic
+    if (text === "📋 View Watchlist") {
+        const user = await User.findOne({ chatId });
+        if (!user || !user.wallets.length) return bot.sendMessage(chatId, "Empty.");
+        const buttons = user.wallets.map(w => [{ text: `🗑 ${w.name}`, callback_data: `DEL_${w.address}` }]);
+        bot.sendMessage(chatId, "Your Watchlist:", { reply_markup: { inline_keyboard: buttons } });
+    }
+});
+
+bot.on('callback_query', async (q) => {
+    if (q.data.startsWith('DEL_')) {
+        await User.updateOne({ chatId: q.message.chat.id }, { $pull: { wallets: { address: q.data.replace('DEL_', '') } } });
+        bot.answerCallbackQuery(q.id, { text: "Deleted" });
+        bot.deleteMessage(q.message.chat.id, q.message.message_id);
+    }
+});
+
+// ============================================================
+// 🔄 LOOPS
+// ============================================================
+
+// Loop 1: Check Private Wallets (Every 15s)
+setInterval(async () => {
+    const users = await User.find({});
+    for (const user of users) {
+        await scanSpecificWallets(user.chatId);
+    }
+}, USER_SCAN_INTERVAL);
+
+// Loop 2: Check Global Market (Every 15s)
+setInterval(async () => {
+    await scanGlobalMarket();
+}, GLOBAL_SCAN_INTERVAL);
+
+console.log("🔥 Watcher Bot v2: Wolf Pack Edition Running...");
