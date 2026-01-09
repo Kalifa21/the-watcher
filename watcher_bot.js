@@ -79,12 +79,14 @@ class MarketDetector {
 
             let alertType = null;
 
-            // --- CONDITION A: WOLF PACK (3+ Strangers, >$10k) ---
-            if (uniqueBuyers >= 3 && buyVol > 10000) {
+            // --- CONDITION A: WOLF PACK (LOWERED LIMIT) ---
+            // 3+ Strangers, Volume > $100 (Was $10k)
+            if (uniqueBuyers >= 3 && buyVol > 100) {
                 alertType = "WOLF_PACK";
             }
-            // --- CONDITION B: VOLUME SURGE (Any Count, >$15k) ---
-            else if (buyVol > 15000) {
+            // --- CONDITION B: VOLUME SURGE (LOWERED LIMIT) ---
+            // Any Count, Volume > $150 (Was $15k)
+            else if (buyVol > 150) {
                 alertType = "VOLUME_SURGE";
             }
 
@@ -97,7 +99,8 @@ class MarketDetector {
                     totalVol: buyVol,
                     uniqueWallets: uniqueBuyers,
                     ratio: ratio,
-                    marketId: marketId
+                    marketId: marketId,
+                    marketSlug: data.meta.marketSlug
                 });
             }
         }
@@ -142,7 +145,6 @@ async function scanSpecificWallets(chatId, isManual = false) {
                         bot.sendMessage(chatId, msg, { parse_mode: "HTML", disable_web_page_preview: true });
                         updatesFound = true;
                     }
-                    // Update DB with new hash
                     await User.updateOne(
                         { chatId, "wallets.address": w.address },
                         { $set: { "wallets.$.lastHash": currentHash } }
@@ -167,7 +169,7 @@ async function scanSpecificWallets(chatId, isManual = false) {
 // ============================================================
 async function scanGlobalMarket() {
     try {
-        // 1. Get Top 20 Trending Markets (Hot List)
+        // 1. Get Top 20 Trending Markets
         const { data: markets } = await axios.get('https://gamma-api.polymarket.com/markets', {
             params: {
                 limit: 20,
@@ -178,10 +180,10 @@ async function scanGlobalMarket() {
             }
         });
 
-        // 2. Scan each Hot Market for new trades
+        // 2. Scan each Hot Market
         const scanPromises = markets.map(async (market) => {
             try {
-                // Fetch last 5 trades for this specific market
+                // Fetch last 5 trades
                 const { data: trades } = await axios.get(`https://data-api.polymarket.com/activity`, {
                     params: {
                         limit: 5,
@@ -205,9 +207,7 @@ async function scanGlobalMarket() {
                         });
                     }
                 });
-            } catch (err) {
-                // Ignore individual market errors
-            }
+            } catch (err) { }
         });
 
         await Promise.all(scanPromises);
@@ -253,7 +253,6 @@ function formatAlert(alert) {
 // ============================================================
 bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
-    // Get wallet count for better UX
     let user = await User.findOne({ chatId });
     const walletCount = user ? user.wallets.length : 0;
 
@@ -335,9 +334,9 @@ bot.on('message', async (msg) => {
             "1️⃣ **Sentinel (Private Spy):**\n" +
             "Add up to 5 wallets. You get an alert whenever they trade.\n\n" +
             "2️⃣ **Wolf Pack (Global Radar):**\n" +
-            "I automatically scan the Top 20 trending markets. If 3+ strangers buy together (>$10k), you get an alert.\n\n" +
+            "I automatically scan the Top 20 trending markets. If 3+ strangers buy together (>$100), you get an alert.\n\n" +
             "3️⃣ **Volume Surge:**\n" +
-            "Alerts if ANYONE buys >$15k in a single clip.";
+            "Alerts if ANYONE buys >$150 in a single clip.";
         
         bot.sendMessage(chatId, helpMsg, { parse_mode: "Markdown" });
     }
